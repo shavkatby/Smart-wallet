@@ -37,5 +37,6 @@ def stt_handler():
             return "Tushunarsiz ovoz"
 
 if __name__ == '__main__':
-    # Kompyuter IP manzilini kiriting (masalan: 192.168.1.10)
-    app.run(host='0.0.0.0', port=5000)
+    # Railway PORT muhit o'zgaruvchisini beradi, agar bo'lmasa 5000-ni oladi
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)
