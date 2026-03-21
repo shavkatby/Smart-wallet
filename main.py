@@ -1,104 +1,169 @@
 import os
 import io
 import wave
-from flask import Flask, request
+import struct
+import math
 import speech_recognition as sr
+from flask import Flask, request
 
 app = Flask(__name__)
 recognizer = sr.Recognizer()
 
-# Recognizer sozlamalari
-recognizer.energy_threshold = 300
-recognizer.dynamic_energy_threshold = True
-recognizer.pause_threshold = 0.8
+# STT sozlamalari - shovqinga chidamli
+recognizer.energy_threshold = 200          # past ovozni ham ushlash
+recognizer.dynamic_energy_threshold = False # o'zgarmas chegara (barqarorroq)
+recognizer.pause_threshold = 0.6
+recognizer.phrase_threshold = 0.2
+recognizer.non_speaking_duration = 0.3
 
 
-def build_wav_from_pcm(pcm_bytes, sample_rate=16000, channels=1, sampwidth=2):
-    """PCM raw bytes dan to'liq WAV fayl yasaydi"""
+def normalize_pcm(pcm_bytes, target_rms=8000):
+    """
+    PCM audio amplitudasini oshiradi (normalizatsiya).
+    ESP32 mikrofoni past signal beradi - bu shovqin/raqam xatolarini kamaytiradi.
+    """
+    if len(pcm_bytes) < 2:
+        return pcm_bytes
+
+    # 16-bit signed samplelarni o'qish
+    num_samples = len(pcm_bytes) // 2
+    samples = struct.unpack(f'<{num_samples}h', pcm_bytes[:num_samples * 2])
+
+    # RMS (o'rtacha kvadrat) hisoblash
+    rms = math.sqrt(sum(s * s for s in samples) / num_samples) if num_samples > 0 else 1
+
+    if rms < 10:
+        print(f">>> Ogohlantirish: juda past signal (RMS={rms:.1f}) - shovqin bo'lishi mumkin")
+        return pcm_bytes  # juda past - normalizatsiya qilmaymiz
+
+    # Ko'paytirish koeffitsienti
+    gain = min(target_rms / rms, 12.0)  # maksimum 12x oshirish
+    print(f">>> Audio: RMS={rms:.1f}, Gain={gain:.2f}x")
+
+    # Yangi samplelar yaratish (16-bit oralig'idan chiqmasin)
+    new_samples = []
+    for s in samples:
+        amplified = int(s * gain)
+        amplified = max(-32768, min(32767, amplified))  # clamp
+        new_samples.append(amplified)
+
+    return struct.pack(f'<{len(new_samples)}h', *new_samples)
+
+
+def remove_dc_offset(pcm_bytes):
+    """
+    DC offset (o'rtacha qiymat) ni olib tashlaydi.
+    INMP441 ba'zan DC bias beradi - bu raqam xatolariga sabab bo'ladi.
+    """
+    num_samples = len(pcm_bytes) // 2
+    if num_samples < 2:
+        return pcm_bytes
+
+    samples = struct.unpack(f'<{num_samples}h', pcm_bytes[:num_samples * 2])
+    mean = sum(samples) // num_samples
+    corrected = [max(-32768, min(32767, s - mean)) for s in samples]
+    return struct.pack(f'<{len(corrected)}h', *corrected)
+
+
+def build_wav(pcm_bytes, sample_rate=16000):
+    """PCM → WAV"""
     wav_io = io.BytesIO()
     with wave.open(wav_io, 'wb') as wf:
-        wf.setnchannels(channels)
-        wf.setsampwidth(sampwidth)
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
         wf.setframerate(sample_rate)
         wf.writeframes(pcm_bytes)
     wav_io.seek(0)
     return wav_io
 
 
+def try_recognize(pcm_bytes, lang='uz-UZ'):
+    """Berilgan tilda STT qiladi. Matn yoki None qaytaradi."""
+    wav = build_wav(pcm_bytes)
+    with sr.AudioFile(wav) as source:
+        audio = recognizer.record(source)
+    try:
+        return recognizer.recognize_google(audio, language=lang)
+    except sr.UnknownValueError:
+        return None
+    except sr.RequestError as e:
+        raise e
+
+
 @app.route('/')
 def home():
-    return "STT Streaming Server faol! /stt-stream manziliga POST yuboring.", 200
+    return "STT Streaming Server faol!", 200
 
 
-@app.route('/ping', methods=['GET'])
+@app.route('/ping')
 def ping():
-    """ESP32 server tirikligini tekshirishi uchun"""
     return "pong", 200
 
 
 @app.route('/stt-stream', methods=['POST'])
 def stt_stream():
-    """
-    ESP32 dan chunked streaming PCM audio qabul qiladi.
-    ESP32 Content-Type: application/octet-stream yuboradi,
-    Transfer-Encoding: chunked bo'lishi kerak emas - oddiy POST ham ishlaydi.
-    Audio to'liq kelgandan keyin WAV ga o'girib STT qiladi.
-    """
-    print(">>> Yangi ulanish: audio qabul qilinmoqda...")
+    print(">>> Yangi so'rov keldi...")
 
-    pcm_chunks = []
-    total_bytes = 0
-    max_bytes = 16000 * 2 * 60  # Maksimum 60 soniya himoya
+    # --- Audio o'qish ---
+    chunks = []
+    total = 0
+    MAX = 16000 * 2 * 60  # 60 soniya limit
+
+    for chunk in request.stream:
+        if chunk:
+            chunks.append(chunk)
+            total += len(chunk)
+            if total >= MAX:
+                print(">>> 60s limitga yetdi, to'xtatildi")
+                break
+
+    if total < 3200:  # 0.1 soniyadan kam = bo'sh
+        print(f">>> Xato: juda kam audio ({total} bayt)")
+        return "Audio kelmadi", 400
+
+    duration = total / 32000
+    print(f">>> {total} bayt ({duration:.1f}s) qabul qilindi")
+
+    # Juda qisqa audio - tushunib bo'lmaydi
+    if duration < 0.5:
+        print(">>> Juda qisqa audio")
+        return "Qisqaroq gapirmang", 200
 
     try:
-        # request.stream - chunked yoki oddiy POST, ikkalasini ham qabul qiladi
-        for chunk in request.stream:
-            if chunk:
-                pcm_chunks.append(chunk)
-                total_bytes += len(chunk)
-                if total_bytes >= max_bytes:
-                    print(">>> Ogohlantirish: maksimum hajmga yetdi")
-                    break
+        pcm = b''.join(chunks)
 
-        if total_bytes == 0:
-            print(">>> Xato: bo'sh audio keldi")
-            return "Audio kelmadi", 400
+        # Audio tozalash va kuchaytirish
+        pcm = remove_dc_offset(pcm)
+        pcm = normalize_pcm(pcm, target_rms=8000)
 
-        print(f">>> {total_bytes} bayt audio ({total_bytes / 32000:.1f} soniya) qabul qilindi")
-
-        pcm_data = b''.join(pcm_chunks)
-
-        # Birinchi urinish: O'zbek tili
-        wav_io = build_wav_from_pcm(pcm_data)
-        with sr.AudioFile(wav_io) as source:
-            recognizer.adjust_for_ambient_noise(source, duration=0.3)
-            audio = recognizer.record(source)
-
-        try:
-            text = recognizer.recognize_google(audio, language='uz-UZ')
+        # --- STT: 3 tilda urinish ---
+        # 1. O'zbek tili
+        text = try_recognize(pcm, 'uz-UZ')
+        if text:
             print(f">>> Natija (uz): {text}")
             return text, 200
 
-        except sr.UnknownValueError:
-            # Ikkinchi urinish: Rus tili
-            print(">>> O'zbek tilida tushunmadi, rus tilida sinamoqda...")
-            try:
-                wav_io2 = build_wav_from_pcm(pcm_data)
-                with sr.AudioFile(wav_io2) as source2:
-                    audio2 = recognizer.record(source2)
-                text_ru = recognizer.recognize_google(audio2, language='ru-RU')
-                print(f">>> Natija (ru): {text_ru}")
-                return text_ru, 200
-            except sr.UnknownValueError:
-                print(">>> Ikki tilda ham tushunmadi")
-                return "Tushunarsiz ovoz", 200
+        # 2. Rus tili
+        print(">>> O'zbek tilida tushunmadi, rus tilida sinamoqda...")
+        text = try_recognize(pcm, 'ru-RU')
+        if text:
+            print(f">>> Natija (ru): {text}")
+            return text, 200
 
-        except sr.RequestError as e:
-            print(f">>> Google API xatosi: {e}")
-            return "Internet xatosi", 503
+        # 3. Ingliz tili (oxirgi urinish)
+        print(">>> Rus tilida ham tushunmadi, inglizda sinamoqda...")
+        text = try_recognize(pcm, 'en-US')
+        if text:
+            print(f">>> Natija (en): {text}")
+            return text, 200
 
+        print(">>> Uch tilda ham tushunmadi")
+        return "Tushunarsiz ovoz", 200
+
+    except sr.RequestError as e:
+        print(f">>> Google API xatosi: {e}")
+        return "Internet xatosi", 503
     except Exception as e:
-        print(f">>> Server xatosi: {e}")
         import traceback
         traceback.print_exc()
         return f"Xato: {str(e)}", 500
